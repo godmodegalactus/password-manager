@@ -1,10 +1,15 @@
-//! Minimal Ledger-over-HID client for the Solana app.
+//! Minimal Ledger-over-HID client for the Ethereum app.
 //!
 //! Implements just enough of the APDU + transport protocol to:
-//!   - fetch the ed25519 pubkey at a derivation path
-//!   - sign an off-chain message at a derivation path
+//!   - fetch the secp256k1 address at a derivation path
+//!   - sign an EIP-191 "personal message" at a derivation path
 //!
-//! Reference: agave/remote-wallet/src/ledger.rs (Solana's own client).
+//! ECDSA over secp256k1 with RFC 6979 nonces is deterministic — the same
+//! (key, message) pair always yields the same signature, which is all the
+//! HKDF password derivation needs. The Ethereum app displays personal
+//! messages verbatim (no envelope; no blind-signing required for ASCII).
+//!
+//! Reference: LedgerHQ/app-ethereum, doc/ethapp.adoc.
 
 use anyhow::{Context, Result, anyhow, bail};
 use hidapi::{HidApi, HidDevice};
@@ -16,27 +21,21 @@ const CHANNEL_ID: u16 = 0x0101;
 const APDU_TAG: u8 = 0x05;
 const APDU_CLA: u8 = 0xe0;
 
-const INS_GET_PUBKEY: u8 = 0x05;
-const INS_SIGN_OFFCHAIN_MESSAGE: u8 = 0x07;
+const INS_GET_PUBLIC_KEY: u8 = 0x02;
+const INS_SIGN_PERSONAL_MESSAGE: u8 = 0x08;
 
 const P1_NON_CONFIRM: u8 = 0x00;
-const P1_CONFIRM: u8 = 0x01;
-const P2_EXTEND: u8 = 0x01;
-const P2_MORE: u8 = 0x02;
+const P1_FIRST_CHUNK: u8 = 0x00;
+const P1_MORE_CHUNK: u8 = 0x80;
 
 const HID_PACKET_SIZE: usize = 64;
 const MAX_APDU_CHUNK: usize = 255;
 
-const OFFCHAIN_SIGNING_DOMAIN: &[u8; 16] = b"\xffsolana offchain";
-const OFFCHAIN_HEADER_VERSION: u8 = 0;
-const OFFCHAIN_APPLICATION_DOMAIN_LEN: usize = 32;
-const OFFCHAIN_FORMAT_ASCII: u8 = 0;
-
-pub struct LedgerSolana {
+pub struct LedgerEth {
     dev: HidDevice,
 }
 
-impl LedgerSolana {
+impl LedgerEth {
     /// Open the first Ledger device found on USB HID.
     pub fn open() -> Result<Self> {
         let api = HidApi::new().context("failed to init hidapi")?;
@@ -51,43 +50,88 @@ impl LedgerSolana {
         Ok(Self { dev })
     }
 
-    /// Fetch the ed25519 pubkey (32 bytes) at the given hardened path.
-    pub fn get_pubkey(&self, path: &[u32]) -> Result<[u8; 32]> {
+    /// Fetch the checksummed hex Ethereum address at the given hardened path
+    /// (e.g. "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B"). Non-confirming —
+    /// no prompt appears on the device. The uppercase-hex payload the app
+    /// returns is EIP-55 checksummed; we prefix "0x" and hand it back as-is.
+    pub fn get_address(&self, path: &[u32]) -> Result<String> {
         let data = serialize_path(path);
-        let resp = self.exchange(INS_GET_PUBKEY, P1_NON_CONFIRM, 0, &data)?;
-        if resp.len() != 32 {
-            bail!("unexpected pubkey length: {}", resp.len());
+        let resp = self.exchange(INS_GET_PUBLIC_KEY, P1_NON_CONFIRM, 0, &data)?;
+        // Layout: [pubkey_len (1)][pubkey (=65)][address_len (1)][address (=40 ASCII hex)]
+        if resp.len() < 1 {
+            bail!("empty GET_PUBLIC_KEY response");
         }
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&resp);
-        Ok(out)
+        let pk_len = resp[0] as usize;
+        let addr_len_off = 1 + pk_len;
+        if resp.len() < addr_len_off + 1 {
+            bail!("short GET_PUBLIC_KEY response");
+        }
+        let addr_len = resp[addr_len_off] as usize;
+        let addr_off = addr_len_off + 1;
+        if resp.len() < addr_off + addr_len {
+            bail!("truncated address in GET_PUBLIC_KEY response");
+        }
+        let ascii = &resp[addr_off..addr_off + addr_len];
+        let hex = std::str::from_utf8(ascii)
+            .context("address is not ASCII hex")?;
+        Ok(format!("0x{}", hex))
     }
 
-    /// Sign an off-chain message with the ed25519 key at the given path.
-    /// Returns the 64-byte signature, wrapped so drop zeros the memory.
-    pub fn sign_offchain(&self, path: &[u32], message: &[u8]) -> Result<Zeroizing<[u8; 64]>> {
-        // The Solana app parses the envelope's `signers` list and rejects with
-        // InvalidMessageHeader unless the pubkey derived at `path` appears in
-        // it — so fetch our own pubkey (non-confirming) and include it.
-        let signer = self.get_pubkey(path)?;
-        let envelope = build_offchain_envelope(message, &signer)?;
-        let mut payload = serialize_path(path);
-        payload.extend_from_slice(&envelope);
-
-        let mut p2: u8 = 0;
-        let mut slice = payload.as_slice();
-        while slice.len() > MAX_APDU_CHUNK {
-            let (chunk, rest) = slice.split_at(MAX_APDU_CHUNK);
-            self.exchange(INS_SIGN_OFFCHAIN_MESSAGE, P1_CONFIRM, p2 | P2_MORE, chunk)?;
-            slice = rest;
-            p2 |= P2_EXTEND;
+    /// Sign an EIP-191 personal message with the secp256k1 key at `path`.
+    /// The app internally hashes `keccak256("\x19Ethereum Signed Message:\n"
+    /// || len(msg) || msg)` and signs that. Returns the 65-byte [v, r, s]
+    /// signature, wrapped so drop zeros the memory.
+    pub fn sign_personal(&self, path: &[u32], message: &[u8]) -> Result<Zeroizing<[u8; 65]>> {
+        // We restrict callers to printable ASCII so the app can show the
+        // message verbatim (rather than falling back to hex) and so the
+        // signed material has no ambiguity.
+        if !message.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+            bail!("password derivation message must be printable ASCII");
         }
-        let resp = self.exchange(INS_SIGN_OFFCHAIN_MESSAGE, P1_CONFIRM, p2, slice)?;
+        if message.len() > u32::MAX as usize {
+            bail!("message too long");
+        }
 
-        if resp.len() != 64 {
+        // First-chunk header: [path_len][path...][msg_len BE u32]. Message
+        // bytes then fill the rest of the first APDU; anything left flows
+        // into P1_MORE_CHUNK continuations of up to 255 raw message bytes.
+        let path_bytes = serialize_path(path);
+        let mut header = Vec::with_capacity(path_bytes.len() + 4);
+        header.extend_from_slice(&path_bytes);
+        header.extend_from_slice(&(message.len() as u32).to_be_bytes());
+        if header.len() > MAX_APDU_CHUNK {
+            bail!("derivation path too long for first APDU");
+        }
+
+        let first_room = MAX_APDU_CHUNK - header.len();
+        let first_take = std::cmp::min(first_room, message.len());
+        let mut first_chunk = Vec::with_capacity(header.len() + first_take);
+        first_chunk.extend_from_slice(&header);
+        first_chunk.extend_from_slice(&message[..first_take]);
+
+        let mut resp = self.exchange(
+            INS_SIGN_PERSONAL_MESSAGE,
+            P1_FIRST_CHUNK,
+            0,
+            &first_chunk,
+        )?;
+
+        let mut sent = first_take;
+        while sent < message.len() {
+            let take = std::cmp::min(MAX_APDU_CHUNK, message.len() - sent);
+            resp = self.exchange(
+                INS_SIGN_PERSONAL_MESSAGE,
+                P1_MORE_CHUNK,
+                0,
+                &message[sent..sent + take],
+            )?;
+            sent += take;
+        }
+
+        if resp.len() != 65 {
             bail!("unexpected signature length: {}", resp.len());
         }
-        let mut sig = Zeroizing::new([0u8; 64]);
+        let mut sig = Zeroizing::new([0u8; 65]);
         sig.copy_from_slice(&resp);
         Ok(sig)
     }
@@ -189,7 +233,7 @@ impl LedgerSolana {
         match sw {
             0x9000 => Ok(buf),
             0x6985 => bail!("user rejected the request on the device"),
-            0x6d00 => bail!("instruction not supported — is the Solana app open?"),
+            0x6d00 => bail!("instruction not supported — is the Ethereum app open?"),
             0x6e00 => bail!("app not open on device"),
             other => bail!("Ledger error: SW=0x{:04x}", other),
         }
@@ -206,96 +250,46 @@ fn serialize_path(path: &[u32]) -> Vec<u8> {
     out
 }
 
-/// Wrap `message` in the Solana v0 off-chain message envelope, as parsed by
-/// the app-solana Ledger firmware:
-///   [signing_domain 16B]
-///   [version=0 1B]
-///   [application_domain 32B]   (zeroed — no per-app binding)
-///   [format=0 1B]              (RestrictedAscii)
-///   [signer_count=1 1B]
-///   [signer 32B]               (must match the pubkey the device derives)
-///   [len LE u16]
-///   [message]
-fn build_offchain_envelope(message: &[u8], signer: &[u8; 32]) -> Result<Vec<u8>> {
-    if !message.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
-        bail!("password derivation message must be printable ASCII");
-    }
-    if message.len() > u16::MAX as usize {
-        bail!("off-chain message too long");
-    }
-    let mut env = Vec::with_capacity(
-        OFFCHAIN_SIGNING_DOMAIN.len()
-            + 1
-            + OFFCHAIN_APPLICATION_DOMAIN_LEN
-            + 1
-            + 1
-            + signer.len()
-            + 2
-            + message.len(),
-    );
-    env.extend_from_slice(OFFCHAIN_SIGNING_DOMAIN);
-    env.push(OFFCHAIN_HEADER_VERSION);
-    env.extend_from_slice(&[0u8; OFFCHAIN_APPLICATION_DOMAIN_LEN]);
-    env.push(OFFCHAIN_FORMAT_ASCII);
-    env.push(1);
-    env.extend_from_slice(signer);
-    env.extend_from_slice(&(message.len() as u16).to_le_bytes());
-    env.extend_from_slice(message);
-    Ok(env)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn envelope_matches_reference() {
-        // Hand-computed reference for the v0 header layout the app-solana
-        // firmware parses (see libsol/include/sol/offchain_message_signing.h).
-        let signer = [0xAAu8; 32];
-        let got = build_offchain_envelope(b"Test Message", &signer).unwrap();
-        let mut want: Vec<u8> = Vec::new();
-        want.extend_from_slice(b"\xffsolana offchain"); // signing_domain (16)
-        want.push(0); // version
-        want.extend_from_slice(&[0u8; 32]); // application_domain
-        want.push(0); // format (RestrictedAscii)
-        want.push(1); // signer_count
-        want.extend_from_slice(&signer); // signers[0]
-        want.extend_from_slice(&12u16.to_le_bytes()); // message length
-        want.extend_from_slice(b"Test Message");
-        assert_eq!(got, want);
-        assert_eq!(got.len(), 16 + 1 + 32 + 1 + 1 + 32 + 2 + 12);
-    }
-
-    /// Golden regression test: pins the exact password derived from a fixed
-    /// Ed25519 keypair signing a fixed pwmgr message through the real V0
-    /// envelope. If this test fails, either the envelope layout or the
-    /// derivation changed — both silently rotate every user's passwords, so
-    /// do NOT update the golden value without a migration plan.
-    #[test]
-    fn golden_password_end_to_end() {
-        use crate::derive::{Charset, build_message, derive_password};
-        use ed25519_dalek::{Signer, SigningKey};
-
-        let sk = SigningKey::from_bytes(&[0x11u8; 32]);
-        let pk = sk.verifying_key().to_bytes();
-
-        let message = build_message("example.com", "alice", 0);
-        let envelope = build_offchain_envelope(message.as_bytes(), &pk).unwrap();
-        let sig_bytes: [u8; 64] = sk.sign(&envelope).to_bytes();
-
-        let password = derive_password(&sig_bytes, &message, 20, Charset::Symbols).unwrap();
-        assert_eq!(&*password as &str, "[m08_>43ViG&<3[0xBl3");
-    }
-
-    #[test]
     fn path_serialization() {
-        // m/44'/501'/255'
-        let path = [0x8000_002c, 0x8000_01f5, 0x8000_00ff];
+        // m/44'/60'/0'/0/0
+        let path = [0x8000_002c, 0x8000_003c, 0x8000_0000, 0, 0];
         let got = serialize_path(&path);
         assert_eq!(
             got,
-            vec![3, 0x80, 0, 0, 0x2c, 0x80, 0, 1, 0xf5, 0x80, 0, 0, 0xff]
+            vec![
+                5,
+                0x80, 0, 0, 0x2c,
+                0x80, 0, 0, 0x3c,
+                0x80, 0, 0, 0,
+                0, 0, 0, 0,
+                0, 0, 0, 0,
+            ]
         );
+    }
+
+    /// Regression pin: fixed 65-byte "signature" bytes and a fixed message
+    /// must always derive the same password. If this fails, either the HKDF
+    /// info string or the alphabet changed — both silently rotate every
+    /// user's passwords, so do NOT update the golden value without a
+    /// migration plan.
+    #[test]
+    fn golden_password_pins_derivation() {
+        use crate::derive::{Charset, build_message, derive_password};
+
+        // Pretend the Ledger returned this signature for the message below.
+        // The bytes don't need to be a valid ECDSA signature — HKDF only
+        // treats them as input key material.
+        let mut sig = [0u8; 65];
+        for (i, b) in sig.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let message = build_message("example.com", "alice", 0);
+        let password = derive_password(&sig, &message, 20, Charset::Symbols).unwrap();
+        assert_eq!(&*password as &str, ":VB5qou]$AuzJfGRv,/;");
     }
 }

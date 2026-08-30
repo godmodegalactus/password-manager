@@ -81,28 +81,43 @@ impl Store {
     // Callers pass sites already canonicalized via `canonicalize_site`, so
     // comparison is exact. That keeps the string used for Ledger derivation
     // (which is case-sensitive) in lockstep with the string used for lookup.
-    pub fn find(&self, site: &str) -> Option<&Entry> {
-        self.entries.iter().find(|e| e.site == site)
+    // Entries are keyed by (site, username): a service can have multiple
+    // accounts, and each is a distinct entry with its own derived password.
+    pub fn find(&self, site: &str, username: &str) -> Option<&Entry> {
+        self.entries
+            .iter()
+            .find(|e| e.site == site && e.username == username)
     }
 
-    pub fn find_mut(&mut self, site: &str) -> Option<&mut Entry> {
-        self.entries.iter_mut().find(|e| e.site == site)
+    pub fn find_mut(&mut self, site: &str, username: &str) -> Option<&mut Entry> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.site == site && e.username == username)
+    }
+
+    /// All entries for a given site, in stored order. Used to auto-select
+    /// when only one account exists for the site, and to list candidates
+    /// when the caller needs to disambiguate by username.
+    pub fn find_by_site(&self, site: &str) -> Vec<&Entry> {
+        self.entries.iter().filter(|e| e.site == site).collect()
     }
 
     pub fn upsert(&mut self, entry: Entry) -> bool {
-        if let Some(slot) = self.find_mut(&entry.site) {
+        if let Some(slot) = self.find_mut(&entry.site, &entry.username) {
             *slot = entry;
             false
         } else {
             self.entries.push(entry);
-            self.entries.sort_by(|a, b| a.site.cmp(&b.site));
+            self.entries
+                .sort_by(|a, b| a.site.cmp(&b.site).then_with(|| a.username.cmp(&b.username)));
             true
         }
     }
 
-    pub fn remove(&mut self, site: &str) -> bool {
+    pub fn remove(&mut self, site: &str, username: &str) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|e| e.site != site);
+        self.entries
+            .retain(|e| !(e.site == site && e.username == username));
         self.entries.len() != before
     }
 }
@@ -199,5 +214,49 @@ mod tests {
         assert!(validate_username("with:colon").is_err());
         assert!(validate_username("café").is_err());
         assert!(validate_username("nl\n").is_err());
+    }
+
+    fn e(site: &str, user: &str) -> Entry {
+        Entry {
+            site: site.into(),
+            username: user.into(),
+            length: 20,
+            charset: Charset::Symbols,
+            counter: 0,
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn multiple_usernames_for_same_site_coexist() {
+        let mut s = Store::default();
+        assert!(s.upsert(e("github.com", "alice")));
+        assert!(s.upsert(e("github.com", "bob")));
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.find_by_site("github.com").len(), 2);
+        assert_eq!(s.find("github.com", "alice").unwrap().username, "alice");
+        assert_eq!(s.find("github.com", "bob").unwrap().username, "bob");
+    }
+
+    #[test]
+    fn upsert_matches_site_and_username() {
+        let mut s = Store::default();
+        s.upsert(e("github.com", "alice"));
+        s.upsert(e("github.com", "bob"));
+        let mut updated = e("github.com", "alice");
+        updated.counter = 7;
+        assert!(!s.upsert(updated));
+        assert_eq!(s.find("github.com", "alice").unwrap().counter, 7);
+        assert_eq!(s.find("github.com", "bob").unwrap().counter, 0);
+    }
+
+    #[test]
+    fn remove_targets_one_account_not_the_whole_site() {
+        let mut s = Store::default();
+        s.upsert(e("github.com", "alice"));
+        s.upsert(e("github.com", "bob"));
+        assert!(s.remove("github.com", "alice"));
+        assert!(s.find("github.com", "alice").is_none());
+        assert!(s.find("github.com", "bob").is_some());
     }
 }
