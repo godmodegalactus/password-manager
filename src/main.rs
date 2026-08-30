@@ -1,9 +1,10 @@
 //! pwmgr — deterministic password manager backed by a Ledger hardware wallet.
 //!
-//! Passwords are derived on-demand from an Ed25519 signature produced by the
-//! Solana app at a dedicated derivation path (m/44'/501'/255'). Nothing
-//! sensitive is ever stored on disk — losing the entries file just means
-//! losing the per-site policy (length, charset).
+//! Passwords are derived on-demand from a secp256k1 ECDSA signature produced
+//! by the Ethereum app's EIP-191 `personal_sign` at a dedicated derivation
+//! path (m/44'/60'/0x1627ddd1'/0/0). Nothing sensitive is ever stored on
+//! disk — losing the entries file just means losing the per-site policy
+//! (length, charset).
 
 mod derive;
 mod ledger;
@@ -13,20 +14,29 @@ use anyhow::{Context, Result, bail};
 use arboard::Clipboard;
 use clap::{Parser, Subcommand};
 use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
+use zeroize::Zeroizing;
 
 use crate::{
     derive::{Charset, build_message, derive_password},
-    ledger::LedgerSolana,
+    ledger::LedgerEth,
     store::{Entry, Store, canonicalize_site, validate_username},
 };
 
-/// Fixed hardened derivation path: m/44'/501'/0x1627ddd1'.
-/// The account index is the first 4 bytes of `sha256("pwmgr")` (big-endian),
-/// masked with 0x7fffffff and then OR'd with the BIP32 hardened flag. This
-/// visibly encodes the app identity in the path so it's obviously reserved.
-/// Do NOT import this key into a wallet used for real Solana transactions.
+/// Standard BIP44 Ethereum path shape (m/44'/60'/account'/change/address_idx)
+/// with a pwmgr-reserved account index. The account is `sha256("pwmgr")[0..4]`
+/// masked with 0x7fffffff and OR'd with the BIP32 hardened flag, so the app
+/// identity is visible in the path and the account is obviously not one you'd
+/// ever type by hand. Do NOT import this key into a wallet you use for real
+/// Ethereum transactions — an attacker who tricked you into personal-signing
+/// a `pwmgr:v1:...` message with that key could recover the site's password.
 const PWMGR_TAG: u32 = 0x1627_ddd1; // sha256("pwmgr")[0..4] as u32 BE
-const PATH: [u32; 3] = [0x8000_002c, 0x8000_01f5, 0x8000_0000 | PWMGR_TAG];
+const PATH: [u32; 5] = [
+    0x8000_002c,             // 44'
+    0x8000_003c,             // 60' (Ethereum)
+    0x8000_0000 | PWMGR_TAG, // pwmgr-reserved account
+    0,                       // change
+    0,                       // address index
+];
 
 #[derive(Parser)]
 #[command(name = "pwmgr", version, about)]
@@ -76,10 +86,14 @@ enum Cmd {
     },
     /// List saved sites and their policy.
     List,
-    /// Remove a saved entry.
-    Rm { site: String },
-    /// Print the Ledger pubkey used for derivation (for sanity checks).
-    Pubkey,
+    /// Remove a saved entry. If the site has more than one account, pass --username.
+    Rm {
+        site: String,
+        #[arg(long, default_value = "")]
+        username: String,
+    },
+    /// Print the Ledger address used for derivation (for sanity checks).
+    Address,
     /// Print the path where entries.json lives.
     Where,
 }
@@ -134,8 +148,8 @@ fn main() -> Result<()> {
             counter,
         ),
         Some(Cmd::List) => cmd_list(),
-        Some(Cmd::Rm { site }) => cmd_rm(site),
-        Some(Cmd::Pubkey) => cmd_pubkey(),
+        Some(Cmd::Rm { site, username }) => cmd_rm(site, username),
+        Some(Cmd::Address) => cmd_address(),
         Some(Cmd::Where) => cmd_where(),
     }
 }
@@ -151,7 +165,7 @@ fn interactive() -> Result<()> {
         "List entries",
         "Add / update entry",
         "Remove entry",
-        "Show Ledger pubkey",
+        "Show Ledger address",
         "Show config path",
         "Quit",
     ];
@@ -167,7 +181,7 @@ fn interactive() -> Result<()> {
             Some(1) => cmd_list(),
             Some(2) => interactive_add(&theme),
             Some(3) => interactive_rm(&theme),
-            Some(4) => cmd_pubkey(),
+            Some(4) => cmd_address(),
             Some(5) => cmd_where(),
             Some(6) | None => return Ok(()),
             _ => unreachable!(),
@@ -211,12 +225,19 @@ fn interactive_get(theme: &ColorfulTheme) -> Result<()> {
     derive_and_copy(&entry, theme)
 }
 
-fn derive_and_copy(entry: &Entry, theme: &ColorfulTheme) -> Result<()> {
+/// Ask the Ledger to sign `entry`'s message and stretch the signature into a
+/// password. Prints the "Approve on Ledger:" hint before opening the device
+/// so the user knows what to look at.
+fn sign_and_derive(entry: &Entry) -> Result<Zeroizing<String>> {
     let message = build_message(&entry.site, &entry.username, entry.counter);
     eprintln!("Approve on Ledger: {}", message);
-    let ledger = LedgerSolana::open().context("open Ledger")?;
-    let sig = ledger.sign_offchain(&PATH, message.as_bytes())?;
-    let password = derive_password(&*sig, &message, entry.length, entry.charset)?;
+    let ledger = LedgerEth::open().context("open Ledger")?;
+    let sig = ledger.sign_personal(&PATH, message.as_bytes())?;
+    derive_password(&*sig, &message, entry.length, entry.charset)
+}
+
+fn derive_and_copy(entry: &Entry, theme: &ColorfulTheme) -> Result<()> {
+    let password = sign_and_derive(entry)?;
 
     let mut cb = Clipboard::new().context("open clipboard")?;
     cb.set_text(password.as_str()).context("write clipboard")?;
@@ -244,23 +265,35 @@ fn interactive_add(theme: &ColorfulTheme) -> Result<()> {
         .context("site prompt")?;
     let site = canonicalize_site(&site_raw)?;
 
-    let existing = Store::load()?.find(&site).cloned();
-    if let Some(ref e) = existing {
-        eprintln!(
-            "(entry exists — press Enter to keep defaults: user={:?} len={} charset={:?} counter={})",
-            e.username, e.length, e.charset, e.counter
-        );
+    // Show any existing accounts for this site so the user knows whether
+    // they're editing one or adding a new one. Existing-entry defaults are
+    // resolved after the username is entered, since (site, username) is
+    // the identity of an entry.
+    let store_before = Store::load()?;
+    let siblings = store_before.find_by_site(&site);
+    if !siblings.is_empty() {
+        eprintln!("(existing accounts for {}:)", site);
+        for e in &siblings {
+            eprintln!("  - {:?}", e.username);
+        }
     }
 
     let username: String = Input::with_theme(theme)
         .with_prompt("username")
-        .default(existing.as_ref().map(|e| e.username.clone()).unwrap_or_default())
         .allow_empty(true)
         .validate_with(|s: &String| -> Result<(), String> {
             validate_username(s).map_err(|e| e.to_string())
         })
         .interact_text()
         .context("username prompt")?;
+
+    let existing = store_before.find(&site, &username).cloned();
+    if let Some(ref e) = existing {
+        eprintln!(
+            "(entry exists — press Enter to keep defaults: len={} charset={:?} counter={})",
+            e.length, e.charset, e.counter
+        );
+    }
 
     let length: usize = Input::with_theme(theme)
         .with_prompt("length")
@@ -312,23 +345,31 @@ fn interactive_add(theme: &ColorfulTheme) -> Result<()> {
         .interact_text()
         .context("notes prompt")?;
 
-    let mut store = Store::load()?;
-    let inserted = store.upsert(Entry {
+    let entry = Entry {
         site: site.clone(),
         username,
         length,
         charset,
         counter,
         notes,
-    });
+    };
+    let mut store = Store::load()?;
+    let inserted = store.upsert(entry.clone());
     let p = store.save()?;
     println!(
-        "{} {} in {}",
+        "{} {} ({}) in {}",
         if inserted { "added" } else { "updated" },
         site,
+        display_username(&entry.username),
         p.display()
     );
-    Ok(())
+    // Derive the password now so the user doesn't have to run `get` right
+    // after `add` — the whole point of registering an entry is to use it.
+    derive_and_copy(&entry, theme)
+}
+
+fn display_username(user: &str) -> &str {
+    if user.is_empty() { "(no user)" } else { user }
 }
 
 fn interactive_rm(theme: &ColorfulTheme) -> Result<()> {
@@ -337,7 +378,11 @@ fn interactive_rm(theme: &ColorfulTheme) -> Result<()> {
         println!("(no entries)");
         return Ok(());
     }
-    let labels: Vec<String> = store.entries.iter().map(|e| e.site.clone()).collect();
+    let labels: Vec<String> = store
+        .entries
+        .iter()
+        .map(|e| format!("{}  ({})", e.site, display_username(&e.username)))
+        .collect();
     let idx = match Select::with_theme(theme)
         .with_prompt("remove which?")
         .items(&labels)
@@ -348,9 +393,13 @@ fn interactive_rm(theme: &ColorfulTheme) -> Result<()> {
         Some(i) => i,
         None => return Ok(()),
     };
-    let site = labels[idx].clone();
+    let target = store.entries[idx].clone();
     let ok = Confirm::with_theme(theme)
-        .with_prompt(format!("really remove {}?", site))
+        .with_prompt(format!(
+            "really remove {} ({})?",
+            target.site,
+            display_username(&target.username)
+        ))
         .default(false)
         .interact_opt()
         .context("confirm prompt")?
@@ -359,9 +408,9 @@ fn interactive_rm(theme: &ColorfulTheme) -> Result<()> {
         println!("(kept)");
         return Ok(());
     }
-    store.remove(&site);
+    store.remove(&target.site, &target.username);
     store.save()?;
-    println!("removed {}", site);
+    println!("removed {} ({})", target.site, display_username(&target.username));
     Ok(())
 }
 
@@ -387,14 +436,20 @@ fn cmd_add(
         counter,
         notes,
     };
-    let inserted = store.upsert(entry);
+    let inserted = store.upsert(entry.clone());
     let path = store.save()?;
-    println!(
-        "{} {} in {}",
+    eprintln!(
+        "{} {} ({}) in {}",
         if inserted { "added" } else { "updated" },
         site,
+        display_username(&entry.username),
         path.display()
     );
+    // Derive right after saving so scripts can pipe the password without a
+    // second `pwmgr get` round-trip. Password goes to stdout, everything
+    // else to stderr.
+    let password = sign_and_derive(&entry)?;
+    println!("{}", *password);
     Ok(())
 }
 
@@ -420,18 +475,12 @@ fn cmd_get(
             notes: String::new(),
         }
     } else {
+        validate_username(&username)?;
         let store = Store::load()?;
-        store
-            .find(&site)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no entry for '{}'. Use `add` first or pass --ad-hoc", site))?
+        resolve_entry(&store, &site, &username)?
     };
 
-    let message = build_message(&entry.site, &entry.username, entry.counter);
-    eprintln!("Approve on Ledger: {}", message);
-    let ledger = LedgerSolana::open().context("open Ledger")?;
-    let sig = ledger.sign_offchain(&PATH, message.as_bytes())?;
-    let password = derive_password(&*sig, &message, entry.length, entry.charset)?;
+    let password = sign_and_derive(&entry)?;
 
     if copy {
         let mut cb = Clipboard::new().context("open clipboard")?;
@@ -466,21 +515,56 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-fn cmd_rm(site: String) -> Result<()> {
+fn cmd_rm(site: String, username: String) -> Result<()> {
     let site = canonicalize_site(&site)?;
+    validate_username(&username)?;
     let mut store = Store::load()?;
-    if !store.remove(&site) {
-        bail!("no entry for '{}'", site);
-    }
+    let target = resolve_entry(&store, &site, &username)?;
+    store.remove(&target.site, &target.username);
     let path = store.save()?;
-    println!("removed {} from {}", site, path.display());
+    println!(
+        "removed {} ({}) from {}",
+        target.site,
+        display_username(&target.username),
+        path.display()
+    );
     Ok(())
 }
 
-fn cmd_pubkey() -> Result<()> {
-    let ledger = LedgerSolana::open().context("open Ledger")?;
-    let pk = ledger.get_pubkey(&PATH)?;
-    println!("{}", bs58_encode(&pk));
+/// Resolve which stored entry the user meant.
+///
+/// - Exact `(site, username)` match wins.
+/// - Otherwise, if the user didn't supply a username *and* the site has
+///   exactly one saved account, use it.
+/// - If the site has multiple accounts and none matched, bail with the
+///   list so the caller can retry with `--username`.
+fn resolve_entry(store: &Store, site: &str, username: &str) -> Result<Entry> {
+    if let Some(e) = store.find(site, username) {
+        return Ok(e.clone());
+    }
+    let siblings = store.find_by_site(site);
+    if username.is_empty() && siblings.len() == 1 {
+        return Ok(siblings[0].clone());
+    }
+    if siblings.is_empty() {
+        bail!("no entry for '{}'. Use `add` first or pass --ad-hoc", site);
+    }
+    let users = siblings
+        .iter()
+        .map(|e| format!("{:?}", e.username))
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!(
+        "site '{}' has multiple accounts ({}). Pass --username to pick one.",
+        site,
+        users
+    );
+}
+
+fn cmd_address() -> Result<()> {
+    let ledger = LedgerEth::open().context("open Ledger")?;
+    let addr = ledger.get_address(&PATH)?;
+    println!("{}", addr);
     Ok(())
 }
 
@@ -505,44 +589,15 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[test]
-    fn pwmgr_tag_matches_sha256() {
+    fn path_matches_bip44_ethereum_with_pwmgr_account() {
         let h = Sha256::digest(b"pwmgr");
         let expected = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) & 0x7fff_ffff;
         assert_eq!(PWMGR_TAG, expected, "PWMGR_TAG drifted from sha256(\"pwmgr\")");
-        assert_eq!(PATH[2] & 0x8000_0000, 0x8000_0000, "path component must be hardened");
+        assert_eq!(PATH[0], 0x8000_002c, "purpose must be BIP44 (44')");
+        assert_eq!(PATH[1], 0x8000_003c, "coin must be Ethereum (60')");
+        assert_eq!(PATH[2] & 0x8000_0000, 0x8000_0000, "account must be hardened");
         assert_eq!(PATH[2] & 0x7fff_ffff, PWMGR_TAG);
+        assert_eq!(PATH[3], 0, "change must be 0");
+        assert_eq!(PATH[4], 0, "address_index must be 0");
     }
-}
-
-/// Minimal Base58 encoder (Bitcoin alphabet) — used only to print the pubkey.
-fn bs58_encode(input: &[u8]) -> String {
-    const ALPH: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-    let mut leading_zeros = 0;
-    for &b in input {
-        if b == 0 {
-            leading_zeros += 1;
-        } else {
-            break;
-        }
-    }
-    let mut num = input.to_vec();
-    let mut out = Vec::new();
-    let mut start = leading_zeros;
-    while start < num.len() {
-        let mut carry = 0u32;
-        for byte in num.iter_mut().skip(start) {
-            let v = (carry << 8) | (*byte as u32);
-            *byte = (v / 58) as u8;
-            carry = v % 58;
-        }
-        out.push(ALPH[carry as usize]);
-        while start < num.len() && num[start] == 0 {
-            start += 1;
-        }
-    }
-    for _ in 0..leading_zeros {
-        out.push(ALPH[0]);
-    }
-    out.reverse();
-    String::from_utf8(out).unwrap()
 }

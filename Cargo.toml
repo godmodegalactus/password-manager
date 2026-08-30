@@ -2,7 +2,7 @@
 name = "pwmgr"
 version = "0.1.0"
 edition = "2021"
-description = "Deterministic password manager backed by a Ledger hardware wallet running the Solana app"
+description = "Deterministic password manager backed by a Ledger hardware wallet running the Ethereum app"
 
 [dependencies]
 anyhow = "1"

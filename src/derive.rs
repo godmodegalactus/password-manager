@@ -44,8 +44,12 @@ impl Charset {
 /// Deterministically derive a password of `length` characters over `charset`
 /// from the given signature bytes. Uses HKDF-SHA256 with a domain-separating
 /// info string, then rejection-samples bytes to avoid modulo bias.
+///
+/// Takes a 65-byte input because that's what the Ethereum app's personal_sign
+/// returns ([v, r, s]); HKDF doesn't care about the length, but pinning the
+/// type keeps callers honest.
 pub fn derive_password(
-    signature: &[u8; 64],
+    signature: &[u8; 65],
     message: &str,
     length: usize,
     charset: Charset,
@@ -94,7 +98,7 @@ mod tests {
 
     #[test]
     fn same_inputs_same_password() {
-        let sig = [7u8; 64];
+        let sig = [7u8; 65];
         let a = derive_password(&sig, "pwmgr:v1:github.com:me:0", 20, Charset::Symbols).unwrap();
         let b = derive_password(&sig, "pwmgr:v1:github.com:me:0", 20, Charset::Symbols).unwrap();
         assert_eq!(*a, *b);
@@ -103,7 +107,7 @@ mod tests {
 
     #[test]
     fn different_message_different_password() {
-        let sig = [7u8; 64];
+        let sig = [7u8; 65];
         let a = derive_password(&sig, "pwmgr:v1:github.com:me:0", 20, Charset::Symbols).unwrap();
         let b = derive_password(&sig, "pwmgr:v1:gitlab.com:me:0", 20, Charset::Symbols).unwrap();
         assert_ne!(*a, *b);
@@ -111,7 +115,7 @@ mod tests {
 
     #[test]
     fn digits_charset_only_digits() {
-        let sig = [42u8; 64];
+        let sig = [42u8; 65];
         let p = derive_password(&sig, "site", 12, Charset::Digits).unwrap();
         assert!(p.chars().all(|c| c.is_ascii_digit()));
     }
