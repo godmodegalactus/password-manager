@@ -29,6 +29,7 @@ const MAX_APDU_CHUNK: usize = 255;
 
 const OFFCHAIN_SIGNING_DOMAIN: &[u8; 16] = b"\xffsolana offchain";
 const OFFCHAIN_HEADER_VERSION: u8 = 0;
+const OFFCHAIN_APPLICATION_DOMAIN_LEN: usize = 32;
 const OFFCHAIN_FORMAT_ASCII: u8 = 0;
 
 pub struct LedgerSolana {
@@ -65,7 +66,11 @@ impl LedgerSolana {
     /// Sign an off-chain message with the ed25519 key at the given path.
     /// Returns the 64-byte signature, wrapped so drop zeros the memory.
     pub fn sign_offchain(&self, path: &[u32], message: &[u8]) -> Result<Zeroizing<[u8; 64]>> {
-        let envelope = build_offchain_envelope(message)?;
+        // The Solana app parses the envelope's `signers` list and rejects with
+        // InvalidMessageHeader unless the pubkey derived at `path` appears in
+        // it — so fetch our own pubkey (non-confirming) and include it.
+        let signer = self.get_pubkey(path)?;
+        let envelope = build_offchain_envelope(message, &signer)?;
         let mut payload = serialize_path(path);
         payload.extend_from_slice(&envelope);
 
@@ -201,19 +206,39 @@ fn serialize_path(path: &[u32]) -> Vec<u8> {
     out
 }
 
-/// Wrap `message` in the Solana v0 off-chain message envelope:
-///   [0xff "solana offchain"][ver=0][format][len LE u16][message]
-fn build_offchain_envelope(message: &[u8]) -> Result<Vec<u8>> {
+/// Wrap `message` in the Solana v0 off-chain message envelope, as parsed by
+/// the app-solana Ledger firmware:
+///   [signing_domain 16B]
+///   [version=0 1B]
+///   [application_domain 32B]   (zeroed — no per-app binding)
+///   [format=0 1B]              (RestrictedAscii)
+///   [signer_count=1 1B]
+///   [signer 32B]               (must match the pubkey the device derives)
+///   [len LE u16]
+///   [message]
+fn build_offchain_envelope(message: &[u8], signer: &[u8; 32]) -> Result<Vec<u8>> {
     if !message.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
         bail!("password derivation message must be printable ASCII");
     }
     if message.len() > u16::MAX as usize {
         bail!("off-chain message too long");
     }
-    let mut env = Vec::with_capacity(OFFCHAIN_SIGNING_DOMAIN.len() + 4 + message.len());
+    let mut env = Vec::with_capacity(
+        OFFCHAIN_SIGNING_DOMAIN.len()
+            + 1
+            + OFFCHAIN_APPLICATION_DOMAIN_LEN
+            + 1
+            + 1
+            + signer.len()
+            + 2
+            + message.len(),
+    );
     env.extend_from_slice(OFFCHAIN_SIGNING_DOMAIN);
     env.push(OFFCHAIN_HEADER_VERSION);
+    env.extend_from_slice(&[0u8; OFFCHAIN_APPLICATION_DOMAIN_LEN]);
     env.push(OFFCHAIN_FORMAT_ASCII);
+    env.push(1);
+    env.extend_from_slice(signer);
     env.extend_from_slice(&(message.len() as u16).to_le_bytes());
     env.extend_from_slice(message);
     Ok(env)
@@ -225,13 +250,42 @@ mod tests {
 
     #[test]
     fn envelope_matches_reference() {
-        // From solana-offchain-message-3.0.0 tests: "Test Message" -> known bytes.
-        let got = build_offchain_envelope(b"Test Message").unwrap();
-        let want: [u8; 32] = [
-            255, 115, 111, 108, 97, 110, 97, 32, 111, 102, 102, 99, 104, 97, 105, 110, 0, 0, 12, 0,
-            84, 101, 115, 116, 32, 77, 101, 115, 115, 97, 103, 101,
-        ];
+        // Hand-computed reference for the v0 header layout the app-solana
+        // firmware parses (see libsol/include/sol/offchain_message_signing.h).
+        let signer = [0xAAu8; 32];
+        let got = build_offchain_envelope(b"Test Message", &signer).unwrap();
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(b"\xffsolana offchain"); // signing_domain (16)
+        want.push(0); // version
+        want.extend_from_slice(&[0u8; 32]); // application_domain
+        want.push(0); // format (RestrictedAscii)
+        want.push(1); // signer_count
+        want.extend_from_slice(&signer); // signers[0]
+        want.extend_from_slice(&12u16.to_le_bytes()); // message length
+        want.extend_from_slice(b"Test Message");
         assert_eq!(got, want);
+        assert_eq!(got.len(), 16 + 1 + 32 + 1 + 1 + 32 + 2 + 12);
+    }
+
+    /// Golden regression test: pins the exact password derived from a fixed
+    /// Ed25519 keypair signing a fixed pwmgr message through the real V0
+    /// envelope. If this test fails, either the envelope layout or the
+    /// derivation changed — both silently rotate every user's passwords, so
+    /// do NOT update the golden value without a migration plan.
+    #[test]
+    fn golden_password_end_to_end() {
+        use crate::derive::{Charset, build_message, derive_password};
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[0x11u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+
+        let message = build_message("example.com", "alice", 0);
+        let envelope = build_offchain_envelope(message.as_bytes(), &pk).unwrap();
+        let sig_bytes: [u8; 64] = sk.sign(&envelope).to_bytes();
+
+        let password = derive_password(&sig_bytes, &message, 20, Charset::Symbols).unwrap();
+        assert_eq!(&*password as &str, "[m08_>43ViG&<3[0xBl3");
     }
 
     #[test]
